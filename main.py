@@ -1,4 +1,4 @@
-""
+"""
 SharpEdge Backend — FastAPI
 Fuentes:
   - The Odds API  → cuotas en vivo (NHL, MLB, NFL, Soccer)
@@ -19,7 +19,7 @@ app = FastAPI(title="SharpEdge API", version="1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -496,4 +496,3 @@ async def chat_endpoint(request: Request):
 
     except Exception as e:
         return {"error": str(e)}
-
