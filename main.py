@@ -378,14 +378,14 @@ def get_summary():
     }
 
 # ────────────────────────────────────────────
-# CHAT ENDPOINT — Perplexity Sonar via backend
-# El frontend llama aquí → backend llama a Perplexity con la key guardada
+# CHAT ENDPOINT — Google Gemini via backend
+# El frontend llama aquí → backend llama a Gemini con la key guardada
 # ────────────────────────────────────────────
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 import json
 
-PPLX_KEY = os.getenv("PPLX_API_KEY", "")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 
 SPORTS_SYSTEM = """Eres SharpEdge AI, un experto analista de apuestas deportivas institucionales.
 Responde SIEMPRE en español. Tono: profesional, directo, analítico, lacónico.
@@ -415,42 +415,77 @@ REGLAS:
 @app.post("/chat")
 async def chat_endpoint(request: Request):
     """
-    Proxy hacia Perplexity Sonar con streaming.
+    Proxy hacia Google Gemini 2.0 Flash con streaming SSE.
     Body esperado: { "messages": [...], "stream": true }
     """
-    if not PPLX_KEY:
-        return {"error": "PPLX_API_KEY not configured in Railway variables"}
+    if not GEMINI_KEY:
+        return {"error": "GEMINI_API_KEY not configured in Railway variables"}
 
     try:
         body = await request.json()
         messages = body.get("messages", [])
 
-        # Inject system prompt
-        full_messages = [{"role": "system", "content": SPORTS_SYSTEM}] + messages[-10:]
+        # Convertir historial al formato Gemini (contents)
+        # Gemini usa roles: "user" y "model" (no "assistant")
+        gemini_contents = []
+        for msg in messages[-10:]:
+            role = "model" if msg["role"] == "assistant" else "user"
+            gemini_contents.append({
+                "role": role,
+                "parts": [{"text": msg["content"]}]
+            })
 
-        async def stream_response():
+        gemini_url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.5-flash:streamGenerateContent?alt=sse&key={GEMINI_KEY}"
+        )
+
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": SPORTS_SYSTEM}]
+            },
+            "contents": gemini_contents,
+            "generationConfig": {
+                "maxOutputTokens": 500,
+                "temperature": 0.4,
+            }
+        }
+
+        async def stream_gemini():
             async with httpx.AsyncClient(timeout=30) as client:
                 async with client.stream(
                     "POST",
-                    "https://api.perplexity.ai/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {PPLX_KEY}",
-                        "Content-Type": "application/json",
-                        "Accept": "text/event-stream",
-                    },
-                    json={
-                        "model": "sonar",
-                        "messages": full_messages,
-                        "stream": True,
-                        "max_tokens": 500,
-                        "temperature": 0.4,
-                    },
+                    gemini_url,
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
                 ) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        d = line[6:].strip()
+                        if d == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            break
+                        try:
+                            parsed = json.loads(d)
+                            text = (
+                                parsed.get("candidates", [{}])[0]
+                                .get("content", {})
+                                .get("parts", [{}])[0]
+                                .get("text", "")
+                            )
+                            if text:
+                                # Reempacar como SSE compatible con el frontend
+                                chunk = json.dumps({
+                                    "choices": [{"delta": {"content": text}}]
+                                })
+                                yield f"data: {chunk}\n\n"
+                        except Exception:
+                            pass
+                    yield "data: [DONE]\n\n"
 
         return StreamingResponse(
-            stream_response(),
+            stream_gemini(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
