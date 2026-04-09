@@ -376,3 +376,88 @@ def get_summary():
         "total_games_today": sum(len(g) for g in _cache["odds"].values()),
         "sports_active":     [s for s, g in _cache["odds"].items() if g],
     }
+
+# ────────────────────────────────────────────
+# CHAT ENDPOINT — Perplexity Sonar via backend
+# El frontend llama aquí → backend llama a Perplexity con la key guardada
+# ────────────────────────────────────────────
+from fastapi import Request
+from fastapi.responses import StreamingResponse
+import json
+
+PPLX_KEY = os.getenv("PPLX_API_KEY", "")
+
+SPORTS_SYSTEM = """Eres SharpEdge AI, un experto analista de apuestas deportivas institucionales.
+Responde SIEMPRE en español. Tono: profesional, directo, analítico, lacónico.
+
+CONTEXTO DEL DASHBOARD (9 de abril de 2026):
+JUGADAS ACTIVAS HOY:
+1. Minnesota Wild ML +105 — NHL vs Dallas Stars 9PM ET — Conf 74% — Edge +51.7% — 1.5u = $7.50
+   Razones: RLM sharp (+110→+105 sin movimiento DAL), racha 4W MIN, H2H 2-1 vs DAL, Roope Hintz (C top-6 DAL) OUT
+2. Under 6.5 -135 — NHL Wild@Stars 9PM ET — Conf 70% — Edge +21.9% — 1.5u = $7.50
+   Razones: Total abrió 5.5 → subió a 6.5 (medio gol extra), proyección modelos 5.8G, hockey playoff defensivo
+3. Philadelphia Flyers ML +102 — NHL vs Detroit Red Wings 7PM ET — Conf 67% — Edge +35.3% — 1u = $5
+   Razones: RLM masivo PHI +125→-102 (swing 23 cents sharp), PHI 3W consecutivos, DET 3L en casa
+4. Under 9 -111 — MLB White Sox@Royals 7:40PM ET — Conf 63% — Edge +19.8% — 1u = $5
+   Razones: Seth Lugo ERA 1.59 WHIP 0.97, CHW peor ofensiva AL, KC 4-8 Under en casa
+5. Arizona D-Backs ML +139 — MLB vs New York Mets 7:10PM ET — Conf 58% — Edge +38.6% — 0.5u = $2.50
+   Razones: Ryne Nelson ERA 0.00 (2GS) WHIP 0.917, dog de valor, frío NY 47°F viento 11mph
+
+BANKROLL USUARIO: $500 → Unidad base $5 (1%). TOP PLAY 70%+: $7.50. 65-69%: $5. 58-64%: $2.50. Máx $10. Stop-loss $25.
+PARLAYS: Conservador (Wild ML + Under 6.5) → +195. Cross-sport (Wild ML + Under 9 KC) → +275.
+
+REGLAS:
+- Puedes responder sobre CUALQUIER deporte (NHL, MLB, NFL, NBA, Soccer, Tennis, etc.) y CUALQUIER partido, no solo los de hoy
+- Puedes analizar equipos, jugadores, tendencias, estrategias de apuestas, conceptos como RLM, ATS, EV, líneas, totales, spreads, parlays, props, live betting, bankroll management
+- Si el usuario pregunta algo fuera del deporte/apuestas, redirígelo amablemente al tema
+- Máximo 250 palabras por respuesta. Sin markdown excesivo. Usa <strong> para énfasis clave."""
+
+@app.post("/chat")
+async def chat_endpoint(request: Request):
+    """
+    Proxy hacia Perplexity Sonar con streaming.
+    Body esperado: { "messages": [...], "stream": true }
+    """
+    if not PPLX_KEY:
+        return {"error": "PPLX_API_KEY not configured in Railway variables"}
+
+    try:
+        body = await request.json()
+        messages = body.get("messages", [])
+
+        # Inject system prompt
+        full_messages = [{"role": "system", "content": SPORTS_SYSTEM}] + messages[-10:]
+
+        async def stream_response():
+            async with httpx.AsyncClient(timeout=30) as client:
+                async with client.stream(
+                    "POST",
+                    "https://api.perplexity.ai/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {PPLX_KEY}",
+                        "Content-Type": "application/json",
+                        "Accept": "text/event-stream",
+                    },
+                    json={
+                        "model": "sonar",
+                        "messages": full_messages,
+                        "stream": True,
+                        "max_tokens": 500,
+                        "temperature": 0.4,
+                    },
+                ) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    except Exception as e:
+        return {"error": str(e)}
