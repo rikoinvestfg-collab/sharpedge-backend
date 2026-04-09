@@ -446,9 +446,10 @@ async def chat_endpoint(request: Request):
             },
             "contents": gemini_contents,
             "generationConfig": {
-                "maxOutputTokens": 500,
-                "temperature": 0.4,
-            }
+                "maxOutputTokens": 1200,
+                "temperature": 0.3,
+            },
+            "tools": [{"google_search": {}}],
         }
 
         async def stream_gemini():
@@ -468,14 +469,16 @@ async def chat_endpoint(request: Request):
                             break
                         try:
                             parsed = json.loads(d)
-                            text = (
+                            parts = (
                                 parsed.get("candidates", [{}])[0]
                                 .get("content", {})
-                                .get("parts", [{}])[0]
-                                .get("text", "")
+                                .get("parts", [])
+                            )
+                            # Concatenar solo partes de texto (ignorar search metadata)
+                            text = "".join(
+                                p.get("text", "") for p in parts if "text" in p
                             )
                             if text:
-                                # Reempacar como SSE compatible con el frontend
                                 chunk = json.dumps({
                                     "choices": [{"delta": {"content": text}}]
                                 })
