@@ -1,4 +1,4 @@
- SharpEdge Backend — Railway
+# SharpEdge Backend — Railway
 # Endpoints: /health, /odds, /plays, /scores, /injuries, /summary, /chat, /polymarket
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
