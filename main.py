@@ -1,276 +1,251 @@
-# SharpEdge Backend — Railway
-# Endpoints: /health, /odds, /plays, /scores, /injuries, /summary, /chat, /polymarket
+# SharpEdge Backend - Railway
+# Endpoints: /health /plays /scores /injuries /summary /chat /polymarket
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import os, json, datetime, requests, re, math
-from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 CORS(app, origins="*", methods=["GET","POST","OPTIONS"], allow_headers=["Content-Type"])
 
 ODDS_KEY   = os.getenv("ODDS_API_KEY", "")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-ET = ZoneInfo("America/New_York")
-UTC = ZoneInfo("UTC")
 
-# ─────────────────────────── ESPN HELPERS ───────────────────────────
-
-ESPN_SPORT_MAP = {
-    "nhl": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
-    "mlb": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
-    "nba": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-    "mls": "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.1/scoreboard",
+ESPN_SPORTS = {
+    "mlb":  "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
+    "nba":  "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+    "nhl":  "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+    "mls":  "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.1/scoreboard",
 }
-SPORT_LABELS = {"nhl":"NHL","mlb":"MLB","nba":"NBA","mls":"MLS"}
 
-def get_today_str():
-    return datetime.datetime.now(ET).strftime("%Y%m%d")
+def today_str():
+    return datetime.datetime.utcnow().strftime("%Y%m%d")
 
-def fetch_espn_scoreboard(sport_key: str, date_str: str = None) -> list:
-    if date_str is None:
-        date_str = get_today_str()
-    url = ESPN_SPORT_MAP.get(sport_key)
+def espn_fetch(sport, date=None):
+    url = ESPN_SPORTS.get(sport)
     if not url:
         return []
+    params = {"dates": date or today_str(), "limit": 30}
     try:
-        r = requests.get(url, params={"dates": date_str}, timeout=8)
+        r = requests.get(url, params=params, timeout=8)
         return r.json().get("events", [])
-    except Exception as e:
-        print(f"ESPN fetch error {sport_key}: {e}")
+    except Exception:
         return []
 
-def parse_int_odds(s):
+def parse_ml(val):
+    if val is None:
+        return None
     try:
-        return int(str(s).replace("+","").strip())
-    except:
+        return int(str(val).replace("+", ""))
+    except Exception:
         return None
 
-def american_to_prob(o):
-    if o is None: return 0.5
-    o = int(str(o).replace("+",""))
-    return 100/(o+100) if o>0 else abs(o)/(abs(o)+100)
+def to_prob(ml):
+    if ml is None:
+        return 0
+    return abs(ml) / (abs(ml) + 100) if ml < 0 else 100 / (ml + 100)
 
-def vig_free(p1, p2):
-    t = p1 + p2
-    if t == 0: return 0.5, 0.5
-    return p1/t, p2/t
+# ─── /health ───────────────────────────────────────────────────────
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "time": datetime.datetime.utcnow().isoformat()})
 
-def fmt_american(o):
-    if o is None: return "N/A"
-    return f"+{o}" if o > 0 else str(o)
+# ─── /plays ────────────────────────────────────────────────────────
+@app.route("/plays")
+def plays():
+    all_games = []
+    for sport_key in ["mlb", "nba", "nhl", "mls"]:
+        events = espn_fetch(sport_key)
+        for ev in events:
+            comp = (ev.get("competitions") or [{}])[0]
+            comps = comp.get("competitors", [])
+            away = next((c for c in comps if c.get("homeAway") == "away"), None)
+            home = next((c for c in comps if c.get("homeAway") == "home"), None)
+            if not away or not home:
+                continue
+            odds = (comp.get("odds") or [{}])[0]
+            ml = odds.get("moneyline") or {}
+            ml_away = ml.get("away") or {}
+            ml_home = ml.get("home") or {}
+            tot = odds.get("total") or {}
+            under = tot.get("under") or {}
+            away_close = parse_ml((ml_away.get("close") or {}).get("odds"))
+            away_open  = parse_ml((ml_away.get("open")  or {}).get("odds"))
+            home_close = parse_ml((ml_home.get("close") or {}).get("odds"))
+            home_open  = parse_ml((ml_home.get("open")  or {}).get("odds"))
+            under_close = parse_ml((under.get("close") or {}).get("odds"))
+            under_open  = parse_ml((under.get("open")  or {}).get("odds"))
+            over_under  = odds.get("overUnder")
+            status = ((ev.get("status") or {}).get("type") or {}).get("name", "pre")
+            all_games.append({
+                "sport": sport_key.upper(),
+                "matchup": away["team"]["abbreviation"] + " @ " + home["team"]["abbreviation"],
+                "away_abbr": away["team"]["abbreviation"],
+                "home_abbr": home["team"]["abbreviation"],
+                "away_close": away_close, "away_open": away_open,
+                "home_close": home_close, "home_open": home_open,
+                "under_close": under_close, "under_open": under_open,
+                "over_under": over_under,
+                "status": status,
+            })
 
-# ─────────────────────────── PLAYS ENGINE ───────────────────────────
-
-def analyze_espn_event(ev: dict, sport_label: str) -> list:
-    """Analyze a single ESPN event and return candidate plays."""
-    comps = ev.get("competitions", [{}])[0]
-    competitors = comps.get("competitors", [])
-    odds_list = comps.get("odds", [])
-    if not odds_list:
-        return []
-    odds = odds_list[0]
-
-    away = next((c["team"]["displayName"] for c in competitors if c.get("homeAway")=="away"), "Away")
-    home = next((c["team"]["displayName"] for c in competitors if c.get("homeAway")=="home"), "Home")
-    away_abbr = next((c["team"]["abbreviation"] for c in competitors if c.get("homeAway")=="away"), "")
-    home_abbr = next((c["team"]["abbreviation"] for c in competitors if c.get("homeAway")=="home"), "")
-
-    try:
-        ev_dt = datetime.datetime.fromisoformat(ev["date"].replace("Z","+00:00")).astimezone(ET)
-        game_time = ev_dt.strftime("%-I:%M %p ET")
-    except:
-        game_time = "--"
-
-    ml = odds.get("moneyline", {})
-    away_close = parse_int_odds(ml.get("away",{}).get("close",{}).get("odds"))
-    home_close = parse_int_odds(ml.get("home",{}).get("close",{}).get("odds"))
-    away_open  = parse_int_odds(ml.get("away",{}).get("open",{}).get("odds"))
-    home_open  = parse_int_odds(ml.get("home",{}).get("open",{}).get("odds"))
-
-    total_obj   = odds.get("total", {})
-    ou_line     = odds.get("overUnder")
-    under_close = parse_int_odds(total_obj.get("under",{}).get("close",{}).get("odds"))
-    over_close  = parse_int_odds(total_obj.get("over", {}).get("close",{}).get("odds"))
-    under_open  = parse_int_odds(total_obj.get("under",{}).get("open",{}).get("odds"))
-
-    if not (away_close and home_close):
-        return []
-
-    ao = away_open  if away_open  else away_close
-    ho = home_open  if home_open  else home_close
-    away_move = away_close - ao
-    home_move = home_close - ho
-
-    nvp_a, nvp_h = vig_free(american_to_prob(away_close), american_to_prob(home_close))
-    candidates = []
-
-    # ── ML PLAYS ──
-    for team, team_abbr, odds_val, nvp, move in [
-        (away, away_abbr, away_close, nvp_a, away_move),
-        (home, home_abbr, home_close, nvp_h, home_move),
-    ]:
-        inds = []
+    result = []
+    for g in all_games:
+        if g["status"] in ("in", "post", "final"):
+            continue
+        if g["away_close"] is None and g["home_close"] is None:
+            continue
+        indicators = []
         score = 0
-        is_dog = odds_val > 0
+        bet_team = None
+        bet_side = "away"
+        bet_type = "ML"
 
-        # RLM: underdog line shortened = sharp action
-        if is_dog and move < -6:
-            inds.append(f"&#x26A1; RLM → {team.split()[-1]}")
-            score += 12
+        # RLM
+        if g["away_close"] and g["home_close"]:
+            away_udog = g["away_close"] > g["home_close"]
+            if away_udog and g["away_open"] and (g["away_open"] - g["away_close"] > 6):
+                indicators.append("RLM Sharp (Away Dog)")
+                score += 18
+                bet_team = g["away_abbr"]
+            elif not away_udog and g["home_open"] and (g["home_open"] - g["home_close"] > 6):
+                indicators.append("RLM Sharp (Home Dog)")
+                score += 18
+                bet_team = g["home_abbr"]
+                bet_side = "home"
 
-        # Steam: favorite moved by sharps
-        if not is_dog and move < -10:
-            inds.append(f"Steam {team.split()[-1]} ({move:+d}¢)")
-            score += 8
+        # Steam
+        if g["away_close"] and g["home_close"]:
+            fav_away = g["away_close"] < g["home_close"]
+            if fav_away and g["away_open"] and (g["away_open"] - g["away_close"] > 10):
+                indicators.append("Steam Move (Fav Away)")
+                score += 12
+                if not bet_team:
+                    bet_team = g["away_abbr"]
+            elif not fav_away and g["home_open"] and (g["home_open"] - g["home_close"] > 10):
+                indicators.append("Steam Move (Fav Home)")
+                score += 12
+                if not bet_team:
+                    bet_team = g["home_abbr"]
+                    bet_side = "home"
 
-        # NVP value on underdog
-        if is_dog and nvp > 0.40:
-            inds.append(f"NVP {round(nvp*100,1)}%")
-            score += 6
+        # NVP
+        if g["away_close"] and g["home_close"]:
+            pa = to_prob(g["away_close"])
+            ph = to_prob(g["home_close"])
+            vig = pa + ph
+            if vig > 0:
+                away_udog2 = g["away_close"] > g["home_close"]
+                udog_nvp = pa / vig if away_udog2 else ph / vig
+                if udog_nvp > 0.40:
+                    indicators.append("NVP Edge {}%".format(round(udog_nvp * 100)))
+                    score += 10
+                    if not bet_team:
+                        if away_udog2:
+                            bet_team = g["away_abbr"]
+                        else:
+                            bet_team = g["home_abbr"]
+                            bet_side = "home"
 
-        # Sweet spot underdog range
-        if is_dog and 110 <= odds_val <= 200:
-            inds.append(f"Rango +EV ({fmt_american(odds_val)})")
-            score += 4
+        # Sweet Spot
+        if g["away_close"] and g["home_close"]:
+            away_udog3 = g["away_close"] > g["home_close"]
+            udog_odds = g["away_close"] if away_udog3 else g["home_close"]
+            if 110 <= udog_odds <= 210:
+                indicators.append("Sweet Spot +{}".format(udog_odds))
+                score += 8
+                if not bet_team:
+                    if away_udog3:
+                        bet_team = g["away_abbr"]
+                    else:
+                        bet_team = g["home_abbr"]
+                        bet_side = "home"
 
-        # Stable line = no sharp movement but still value
-        if is_dog and abs(move) <= 3 and nvp > 0.38:
-            inds.append("Línea estable · valor intacto")
-            score += 3
+        # Under Sharps
+        if g["under_close"] and g["under_open"] and (g["under_close"] - g["under_open"] > 4):
+            indicators.append("Under Sharps (U{})".format(g["over_under"] or "?"))
+            score += 14
+            bet_type = "UNDER"
 
-        if score >= 10 and len(inds) >= 2:
-            conf = min(74, 50 + score)
-            units = 1.5 if conf>=70 else (1.0 if conf>=65 else (1.0 if conf>=58 else 0.5))
-            stake = 7.50 if units==1.5 else (5.0 if units==1.0 else 2.50)
-            label = "TOP PLAY" if conf>=70 else ("SHARP" if conf>=65 else ("VALUE" if conf>=58 else "WATCH"))
-            book_impl = american_to_prob(odds_val)
-            edge = max(round(abs(nvp - book_impl)*100 + abs(move)*0.3, 1), 3.5)
-            candidates.append({
-                "sport": sport_label,
-                "matchup": f"{away} @ {home}",
-                "away_team": away, "home_team": home,
-                "away_abbr": away_abbr, "home_abbr": home_abbr,
-                "game_time": game_time,
-                "bet": f"{team} ML",
-                "odds": fmt_american(odds_val),
-                "odds_raw": odds_val,
-                "confidence": conf, "edge": edge,
-                "label": label, "units": units, "stake": stake,
-                "indicators": inds,
-                "bookmaker": "DraftKings",
-                "data_sport": sport_label.lower(),
-                "_score": score,
-            })
+        if len(indicators) < 2:
+            continue
 
-    # ── TOTALS ──
-    if under_close and ou_line:
-        uo = under_open if under_open else under_close
-        under_move = under_close - uo
-        t_inds = []
-        t_score = 0
+        conf = min(74, 50 + score)
+        units = 1.5 if conf >= 70 else (1.0 if conf >= 65 else 0.5)
+        stake = units * 5
+        odds_raw = g["under_close"] if bet_type == "UNDER" else (
+            g["away_close"] if bet_side == "away" else g["home_close"]) or 100
+        odds_str = "+{}".format(odds_raw) if odds_raw >= 0 else str(odds_raw)
+        bet = "Under {}".format(g["over_under"] or "?") if bet_type == "UNDER" else \
+              "{} ML".format(bet_team or g["away_abbr"])
 
-        if under_move < -8:
-            t_inds.append(f"&#x26A1; Sharp Under ({under_move:+d}¢)")
-            t_score += 12
+        result.append({
+            "sport": g["sport"],
+            "data_sport": g["sport"].lower(),
+            "matchup": g["matchup"],
+            "bet": bet,
+            "odds": odds_str,
+            "confidence": conf,
+            "label": "TOP PLAY" if conf >= 70 else "JUGADA",
+            "units": units,
+            "stake": stake,
+            "indicators": indicators,
+            "bookmaker": "DraftKings/ESPN",
+        })
 
-        if under_close > -115:
-            t_inds.append(f"Under valor ({fmt_american(under_close)})")
-            t_score += 6
+    result.sort(key=lambda x: -x["confidence"])
+    return jsonify({"plays": result[:8], "total_games_scanned": len(all_games)})
 
-        t_inds.append(f"O/U {ou_line}")
-        t_score += 2
+# ─── /scores ───────────────────────────────────────────────────────
+@app.route("/scores")
+def scores():
+    sport = request.args.get("sport", "mlb").lower()
+    date  = request.args.get("date", today_str())
+    events = espn_fetch(sport, date)
+    out = []
+    for ev in events:
+        comp = (ev.get("competitions") or [{}])[0]
+        comps = comp.get("competitors", [])
+        away = next((c for c in comps if c.get("homeAway") == "away"), {})
+        home = next((c for c in comps if c.get("homeAway") == "home"), {})
+        out.append({
+            "name": ev.get("name", ""),
+            "away": (away.get("team") or {}).get("displayName", ""),
+            "home": (home.get("team") or {}).get("displayName", ""),
+            "away_score": away.get("score", "-"),
+            "home_score": home.get("score", "-"),
+            "status": ((ev.get("status") or {}).get("type") or {}).get("shortDetail", ""),
+            "date": ev.get("date", ""),
+        })
+    return jsonify({"sport": sport, "games": out})
 
-        if t_score >= 8:
-            conf = min(72, 50 + t_score)
-            units = 1.5 if conf>=70 else (1.0 if conf>=65 else (1.0 if conf>=58 else 0.5))
-            stake = 7.50 if units==1.5 else (5.0 if units==1.0 else 2.50)
-            label = "TOP PLAY" if conf>=70 else ("SHARP" if conf>=65 else ("VALUE" if conf>=58 else "WATCH"))
-            edge = max(round(abs(under_move)*0.4, 1), 3.5)
-            candidates.append({
-                "sport": sport_label,
-                "matchup": f"{away} @ {home}",
-                "away_team": away, "home_team": home,
-                "away_abbr": away_abbr, "home_abbr": home_abbr,
-                "game_time": game_time,
-                "bet": f"Under {ou_line}",
-                "odds": fmt_american(under_close),
-                "odds_raw": under_close,
-                "confidence": conf, "edge": edge,
-                "label": label, "units": units, "stake": stake,
-                "indicators": t_inds,
-                "bookmaker": "DraftKings",
-                "data_sport": sport_label.lower(),
-                "_score": t_score,
-            })
+# ─── /injuries ─────────────────────────────────────────────────────
+@app.route("/injuries")
+def injuries():
+    return jsonify({"injuries": [], "note": "Use ESPN team injury pages for live data"})
 
-    return candidates
-
-
-def generate_plays(date_str: str = None) -> dict:
-    """Fetch ESPN data for all sports and return sorted plays."""
-    if date_str is None:
-        date_str = get_today_str()
-
-    all_cands = []
-    total_games = 0
-
-    for sport_key, sport_label in SPORT_LABELS.items():
-        events = fetch_espn_scoreboard(sport_key, date_str)
-        total_games += len(events)
-        for ev in events:
-            cands = analyze_espn_event(ev, sport_label)
-            all_cands.extend(cands)
-
-    # Sort by score * edge descending
-    all_cands.sort(key=lambda p: p["_score"] * p["edge"], reverse=True)
-
-    # Deduplicate: max 1 play per matchup
-    seen = set()
-    top_plays = []
-    for p in all_cands:
-        key = p["matchup"]
-        if key not in seen and len(top_plays) < 8:
-            seen.add(key)
-            p["id"] = len(top_plays) + 1
-            # Clean internal field
-            del p["_score"]
-            top_plays.append(p)
-
-    now_et = datetime.datetime.now(ET)
-    return {
-        "date": date_str,
-        "generated_at": now_et.isoformat(),
-        "total_games_scanned": total_games,
-        "plays_count": len(top_plays),
-        "plays": top_plays,
-        "avg_confidence": round(sum(p["confidence"] for p in top_plays)/max(len(top_plays),1), 1),
-        "top_edge": max((p["edge"] for p in top_plays), default=0),
-        "data_source": "ESPN/DraftKings",
-    }
-
-
-# ─────────────────────────── ESPN SCOREBOARD/SCORES ─────────────────
-
-def build_summary_from_espn():
-    date_str = get_today_str()
+# ─── /summary ──────────────────────────────────────────────────────
+@app.route("/summary")
+def summary():
+    today = today_str()
     total = 0
-    sports_active = []
-    rlm_detected = []
-    injuries = []
+    for s in ["mlb", "nba", "nhl", "mls"]:
+        total += len(espn_fetch(s, today))
+    return jsonify({"games_today": total, "date": today, "status": "ok"})
 
-    for sk, sl in SPORT_LABELS.items():
-        events = fetch_espn_scoreboard(sk, date_str)
-        if events:
-            total += len(events)
-            sports_active.append(sl)
-        # Check for any RLM signals
-        for ev in events:
-            comps = ev.get("competitions", [{}])[0]
-            competitors = comps.get("competitors", [])
-            odds_list = comps.get("odds", [])
-            if not odds_list: continue
-            odds = odds_list[0]
-            ml = odds.get("moneyline", {})
-            away_close = parse_int_odds(ml.get("away",{}).get("close",{}).get("odds"))
-            away_open  = parse_int_odds(ml.get("away",{}).get("open",{}).get("odds"))
-            home_close = parse_i
+# ─── /chat ─────────────────────────────────────────────────────────
+@app.route("/chat", methods=["POST", "OPTIONS"])
+def chat():
+    if request.method == "OPTIONS":
+        resp = app.make_default_options_response()
+        return resp
+    data = request.get_json(silent=True) or {}
+    user_msg = data.get("message", "")
+    history  = data.get("history", [])
+    if not GEMINI_KEY:
+        return jsonify({"error": "No Gemini key configured"}), 500
+
+    system_prompt = (
+        "Eres SharpEdge AI, un experto analista de apuestas institucionales especializado en NFL, NHL, MLB, NBA y Soccer. "
+        "Ayudas a un apostador nuevo con bankroll menor a $500. Unidad base = $5. "
+        "Respondes en español, de forma profesional, directa y precisa. "
+        "Identificas jugadas con al menos 3 i
