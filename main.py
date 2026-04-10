@@ -1,501 +1,276 @@
-"""
-SharpEdge Backend — FastAPI
-Fuentes:
-  - The Odds API  → cuotas en vivo (NHL, MLB, NFL, Soccer)
-  - ESPN API      → scores, schedules, lesiones (gratis, sin key)
-Auto-refresh cada 5 minutos via background task.
-"""
+ SharpEdge Backend — Railway
+# Endpoints: /health, /odds, /plays, /scores, /injuries, /summary, /chat, /polymarket
+from flask import Flask, jsonify, request, Response
+from flask_cors import CORS
+import os, json, datetime, requests, re, math
+from zoneinfo import ZoneInfo
 
-import os
-import asyncio
-import httpx
-from datetime import datetime, timezone
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+app = Flask(__name__)
+CORS(app, origins="*", methods=["GET","POST","OPTIONS"], allow_headers=["Content-Type"])
 
-app = FastAPI(title="SharpEdge API", version="1.0")
+ODDS_KEY   = os.getenv("ODDS_API_KEY", "")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+ET = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
 
-# ── CORS — permite que el dashboard en Perplexity llame al backend ──
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+# ─────────────────────────── ESPN HELPERS ───────────────────────────
 
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
-ODDS_BASE    = "https://api.the-odds-api.com/v4"
-ESPN_BASE    = "https://site.api.espn.com/apis/site/v2/sports"
-
-# ── Cache en memoria ──
-_cache = {
-    "odds":    {},
-    "scores":  {},
-    "injuries":{},
-    "last_updated": None,
-    "rlm_history": {}   # para detectar RLM: guarda cuotas anteriores
+ESPN_SPORT_MAP = {
+    "nhl": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+    "mlb": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
+    "nba": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+    "mls": "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.1/scoreboard",
 }
+SPORT_LABELS = {"nhl":"NHL","mlb":"MLB","nba":"NBA","mls":"MLS"}
 
-# ── Deportes que cubrimos ──
-SPORTS = {
-    "nhl":    "icehockey_nhl",
-    "mlb":    "baseball_mlb",
-    "nfl":    "americanfootball_nfl",
-    "soccer_epl":  "soccer_epl",
-    "soccer_mls":  "soccer_usa_mls",
-}
+def get_today_str():
+    return datetime.datetime.now(ET).strftime("%Y%m%d")
 
-ESPN_SPORTS = {
-    "nhl": ("hockey", "nhl"),
-    "mlb": ("baseball", "mlb"),
-    "nfl": ("football", "nfl"),
-}
-
-# ────────────────────────────────────────────
-# HELPERS
-# ────────────────────────────────────────────
-
-def american_to_decimal(american: int) -> float:
-    if american > 0:
-        return round((american / 100) + 1, 4)
-    return round((100 / abs(american)) + 1, 4)
-
-def implied_prob(american: int) -> float:
-    if american > 0:
-        return round(100 / (american + 100), 4)
-    return round(abs(american) / (abs(american) + 100), 4)
-
-def calc_edge(model_prob: float, american: int) -> float:
-    decimal = american_to_decimal(american)
-    return round((model_prob * decimal - 1) * 100, 1)
-
-def detect_rlm(sport_key: str, game_id: str, team: str, current_odds: int) -> dict:
-    """
-    RLM = línea se mueve hacia el underdog pese al público.
-    Aquí detectamos si la cuota mejoró para el underdog vs hace 5 min.
-    """
-    key = f"{sport_key}:{game_id}:{team}"
-    prev = _cache["rlm_history"].get(key)
-    result = {"detected": False, "movement": 0, "direction": ""}
-    if prev is not None:
-        movement = current_odds - prev
-        if current_odds > 0 and movement > 0:
-            result = {"detected": True, "movement": movement, "direction": "improving_dog"}
-        elif current_odds < 0 and movement > 0:
-            result = {"detected": True, "movement": movement, "direction": "improving_dog"}
-    _cache["rlm_history"][key] = current_odds
-    return result
-
-def extract_bet365(bookmakers: list) -> dict | None:
-    """Extrae cuotas de BET365 si disponible, si no usa el promedio de todos."""
-    for bm in bookmakers:
-        if bm.get("key") in ("bet365", "betfair", "draftkings", "fanduel"):
-            return bm
-    return bookmakers[0] if bookmakers else None
-
-# ────────────────────────────────────────────
-# FETCH ODDS
-# ────────────────────────────────────────────
-
-async def fetch_odds(client: httpx.AsyncClient, sport_key: str) -> list:
-    if not ODDS_API_KEY:
+def fetch_espn_scoreboard(sport_key: str, date_str: str = None) -> list:
+    if date_str is None:
+        date_str = get_today_str()
+    url = ESPN_SPORT_MAP.get(sport_key)
+    if not url:
         return []
     try:
-        r = await client.get(
-            f"{ODDS_BASE}/sports/{sport_key}/odds",
-            params={
-                "apiKey": ODDS_API_KEY,
-                "regions": "us,uk",
-                "markets": "h2h,totals",
-                "oddsFormat": "american",
-                "dateFormat": "iso",
-            },
-            timeout=10,
-        )
-        if r.status_code == 200:
-            return r.json()
-        print(f"Odds API error {r.status_code} for {sport_key}: {r.text[:200]}")
+        r = requests.get(url, params={"dates": date_str}, timeout=8)
+        return r.json().get("events", [])
     except Exception as e:
-        print(f"Odds fetch error ({sport_key}): {e}")
-    return []
+        print(f"ESPN fetch error {sport_key}: {e}")
+        return []
 
-# ────────────────────────────────────────────
-# FETCH ESPN SCORES + INJURIES
-# ────────────────────────────────────────────
-
-async def fetch_espn_scores(client: httpx.AsyncClient, league: str, sport: str) -> list:
+def parse_int_odds(s):
     try:
-        r = await client.get(
-            f"{ESPN_BASE}/{sport}/{league}/scoreboard",
-            timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            games = []
-            for event in data.get("events", []):
-                comp   = event["competitions"][0]
-                status = event["status"]["type"]
-                teams  = {t["team"]["abbreviation"]: {
-                    "name":  t["team"]["displayName"],
-                    "score": t.get("score", "0"),
-                    "record": t.get("records", [{}])[0].get("summary", ""),
-                } for t in comp["competitors"]}
-                games.append({
-                    "id":        event["id"],
-                    "name":      event["name"],
-                    "date":      event["date"],
-                    "status":    status["description"],
-                    "completed": status["completed"],
-                    "teams":     teams,
-                })
-            return games
-    except Exception as e:
-        print(f"ESPN scores error ({league}): {e}")
-    return []
+        return int(str(s).replace("+","").strip())
+    except:
+        return None
 
-async def fetch_espn_injuries(client: httpx.AsyncClient, league: str, sport: str) -> list:
-    try:
-        r = await client.get(
-            f"{ESPN_BASE}/{sport}/{league}/injuries",
-            timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            injuries = []
-            for item in data.get("injuries", []):
-                injuries.append({
-                    "player": item.get("athlete", {}).get("displayName", ""),
-                    "team":   item.get("team", {}).get("abbreviation", ""),
-                    "status": item.get("status", ""),
-                    "detail": item.get("details", {}).get("detail", ""),
-                })
-            return injuries
-    except Exception as e:
-        print(f"ESPN injuries error ({league}): {e}")
-    return []
+def american_to_prob(o):
+    if o is None: return 0.5
+    o = int(str(o).replace("+",""))
+    return 100/(o+100) if o>0 else abs(o)/(abs(o)+100)
 
-# ────────────────────────────────────────────
-# PROCESS & ANALYZE ODDS (RLM + Edge)
-# ────────────────────────────────────────────
+def vig_free(p1, p2):
+    t = p1 + p2
+    if t == 0: return 0.5, 0.5
+    return p1/t, p2/t
 
-def process_game(sport_key: str, game: dict) -> dict:
-    bookmaker = extract_bet365(game.get("bookmakers", []))
-    if not bookmaker:
-        return {}
+def fmt_american(o):
+    if o is None: return "N/A"
+    return f"+{o}" if o > 0 else str(o)
 
-    h2h_market    = next((m for m in bookmaker["markets"] if m["key"] == "h2h"), None)
-    totals_market = next((m for m in bookmaker["markets"] if m["key"] == "totals"), None)
+# ─────────────────────────── PLAYS ENGINE ───────────────────────────
 
-    moneylines = {}
-    if h2h_market:
-        for outcome in h2h_market["outcomes"]:
-            odds_val = int(outcome["price"])
-            team_name = outcome["name"]
-            rlm = detect_rlm(sport_key, game["id"], team_name, odds_val)
-            moneylines[team_name] = {
-                "odds":     odds_val,
-                "odds_fmt": f"+{odds_val}" if odds_val > 0 else str(odds_val),
-                "implied":  f"{implied_prob(odds_val)*100:.1f}%",
-                "rlm":      rlm,
-            }
+def analyze_espn_event(ev: dict, sport_label: str) -> list:
+    """Analyze a single ESPN event and return candidate plays."""
+    comps = ev.get("competitions", [{}])[0]
+    competitors = comps.get("competitors", [])
+    odds_list = comps.get("odds", [])
+    if not odds_list:
+        return []
+    odds = odds_list[0]
 
-    totals = {}
-    if totals_market:
-        for outcome in totals_market["outcomes"]:
-            totals[outcome["name"]] = {
-                "point":    outcome["point"],
-                "odds":     int(outcome["price"]),
-                "odds_fmt": f"+{int(outcome['price'])}" if int(outcome["price"]) > 0 else str(int(outcome["price"])),
-            }
-
-    return {
-        "id":           game["id"],
-        "sport":        sport_key,
-        "home_team":    game["home_team"],
-        "away_team":    game["away_team"],
-        "commence":     game["commence_time"],
-        "bookmaker":    bookmaker["title"],
-        "moneylines":   moneylines,
-        "totals":       totals,
-        "last_update":  bookmaker.get("last_update", ""),
-    }
-
-# ────────────────────────────────────────────
-# REFRESH LOOP — corre cada 5 minutos
-# ────────────────────────────────────────────
-
-async def refresh_data():
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Refreshing data...")
-    async with httpx.AsyncClient() as client:
-        # Fetch odds for all sports in parallel
-        odds_tasks = {
-            key: fetch_odds(client, sport_key)
-            for key, sport_key in SPORTS.items()
-        }
-        odds_results = {}
-        for key, task in odds_tasks.items():
-            odds_results[key] = await task
-
-        # Process odds
-        processed = {}
-        for sport_key, games in odds_results.items():
-            processed[sport_key] = [
-                g for g in (process_game(SPORTS[sport_key], game) for game in games)
-                if g
-            ]
-        _cache["odds"] = processed
-
-        # Fetch ESPN scores + injuries in parallel
-        score_tasks = {}
-        inj_tasks   = {}
-        for key, (sport, league) in ESPN_SPORTS.items():
-            score_tasks[key] = fetch_espn_scores(client, league, sport)
-            inj_tasks[key]   = fetch_espn_injuries(client, league, sport)
-
-        for key in ESPN_SPORTS:
-            _cache["scores"][key]   = await score_tasks[key]
-            _cache["injuries"][key] = await inj_tasks[key]
-
-    _cache["last_updated"] = datetime.now(timezone.utc).isoformat()
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Data refreshed ✓")
-
-async def refresh_loop():
-    while True:
-        await refresh_data()
-        await asyncio.sleep(300)  # 5 minutos
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(refresh_loop())
-
-# ────────────────────────────────────────────
-# ENDPOINTS
-# ────────────────────────────────────────────
-
-@app.get("/")
-def root():
-    return {
-        "name": "SharpEdge API",
-        "version": "1.0",
-        "last_updated": _cache["last_updated"],
-        "endpoints": ["/odds", "/odds/{sport}", "/scores", "/injuries", "/health"]
-    }
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "last_updated": _cache["last_updated"],
-        "odds_sports": list(_cache["odds"].keys()),
-        "api_key_set": bool(ODDS_API_KEY),
-    }
-
-@app.get("/odds")
-def get_all_odds():
-    """Retorna todas las cuotas de todos los deportes."""
-    return {
-        "last_updated": _cache["last_updated"],
-        "data": _cache["odds"],
-    }
-
-@app.get("/odds/{sport}")
-def get_odds_by_sport(sport: str):
-    """Retorna cuotas de un deporte específico: nhl, mlb, nfl, soccer_epl, soccer_mls"""
-    if sport not in _cache["odds"]:
-        return {"error": f"Sport '{sport}' not found. Options: {list(_cache['odds'].keys())}"}
-    return {
-        "sport": sport,
-        "last_updated": _cache["last_updated"],
-        "games": _cache["odds"][sport],
-    }
-
-@app.get("/scores")
-def get_scores():
-    """Retorna scores en vivo de NHL, MLB, NFL."""
-    return {
-        "last_updated": _cache["last_updated"],
-        "data": _cache["scores"],
-    }
-
-@app.get("/scores/{sport}")
-def get_scores_by_sport(sport: str):
-    if sport not in _cache["scores"]:
-        return {"error": f"Sport '{sport}' not found."}
-    return {
-        "sport": sport,
-        "last_updated": _cache["last_updated"],
-        "games": _cache["scores"][sport],
-    }
-
-@app.get("/injuries")
-def get_injuries():
-    """Retorna lesiones actuales de NHL, MLB, NFL."""
-    return {
-        "last_updated": _cache["last_updated"],
-        "data": _cache["injuries"],
-    }
-
-@app.get("/injuries/{sport}")
-def get_injuries_by_sport(sport: str):
-    if sport not in _cache["injuries"]:
-        return {"error": f"Sport '{sport}' not found."}
-    return {
-        "sport": sport,
-        "injuries": _cache["injuries"][sport],
-    }
-
-@app.get("/summary")
-def get_summary():
-    """
-    Endpoint principal para el dashboard.
-    Retorna un resumen consolidado: cuotas + scores + lesiones críticas + RLM detectado.
-    """
-    rlm_detected = []
-    for sport, games in _cache["odds"].items():
-        for game in games:
-            for team, ml in game.get("moneylines", {}).items():
-                if ml.get("rlm", {}).get("detected"):
-                    rlm_detected.append({
-                        "sport":     sport,
-                        "game":      f"{game['away_team']} @ {game['home_team']}",
-                        "team":      team,
-                        "odds":      ml["odds_fmt"],
-                        "movement":  f"+{ml['rlm']['movement']}",
-                    })
-
-    critical_injuries = []
-    for sport, injuries in _cache["injuries"].items():
-        for inj in injuries:
-            if inj.get("status") in ("Out", "Doubtful", "IR"):
-                critical_injuries.append({**inj, "sport": sport})
-
-    return {
-        "last_updated":       _cache["last_updated"],
-        "rlm_detected":       rlm_detected,
-        "critical_injuries":  critical_injuries[:20],
-        "total_games_today": sum(len(g) for g in _cache["odds"].values()),
-        "sports_active":     [s for s, g in _cache["odds"].items() if g],
-    }
-
-# ────────────────────────────────────────────
-# CHAT ENDPOINT — Google Gemini via backend
-# El frontend llama aquí → backend llama a Gemini con la key guardada
-# ────────────────────────────────────────────
-from fastapi import Request
-from fastapi.responses import StreamingResponse
-import json
-
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-
-SPORTS_SYSTEM = """Eres SharpEdge AI, un experto analista de apuestas deportivas institucionales.
-Responde SIEMPRE en español. Tono: profesional, directo, analítico, lacónico.
-
-CONTEXTO DEL DASHBOARD (9 de abril de 2026):
-JUGADAS ACTIVAS HOY:
-1. Minnesota Wild ML +105 — NHL vs Dallas Stars 9PM ET — Conf 74% — Edge +51.7% — 1.5u = $7.50
-   Razones: RLM sharp (+110→+105 sin movimiento DAL), racha 4W MIN, H2H 2-1 vs DAL, Roope Hintz (C top-6 DAL) OUT
-2. Under 6.5 -135 — NHL Wild@Stars 9PM ET — Conf 70% — Edge +21.9% — 1.5u = $7.50
-   Razones: Total abrió 5.5 → subió a 6.5 (medio gol extra), proyección modelos 5.8G, hockey playoff defensivo
-3. Philadelphia Flyers ML +102 — NHL vs Detroit Red Wings 7PM ET — Conf 67% — Edge +35.3% — 1u = $5
-   Razones: RLM masivo PHI +125→-102 (swing 23 cents sharp), PHI 3W consecutivos, DET 3L en casa
-4. Under 9 -111 — MLB White Sox@Royals 7:40PM ET — Conf 63% — Edge +19.8% — 1u = $5
-   Razones: Seth Lugo ERA 1.59 WHIP 0.97, CHW peor ofensiva AL, KC 4-8 Under en casa
-5. Arizona D-Backs ML +139 — MLB vs New York Mets 7:10PM ET — Conf 58% — Edge +38.6% — 0.5u = $2.50
-   Razones: Ryne Nelson ERA 0.00 (2GS) WHIP 0.917, dog de valor, frío NY 47°F viento 11mph
-
-BANKROLL USUARIO: $500 → Unidad base $5 (1%). TOP PLAY 70%+: $7.50. 65-69%: $5. 58-64%: $2.50. Máx $10. Stop-loss $25.
-PARLAYS: Conservador (Wild ML + Under 6.5) → +195. Cross-sport (Wild ML + Under 9 KC) → +275.
-
-REGLAS:
-- Puedes responder sobre CUALQUIER deporte (NHL, MLB, NFL, NBA, Soccer, Tennis, etc.) y CUALQUIER partido, no solo los de hoy
-- Puedes analizar equipos, jugadores, tendencias, estrategias de apuestas, conceptos como RLM, ATS, EV, líneas, totales, spreads, parlays, props, live betting, bankroll management
-- Si el usuario pregunta algo fuera del deporte/apuestas, redirígelo amablemente al tema
-- Máximo 250 palabras por respuesta. Sin markdown excesivo. Usa <strong> para énfasis clave."""
-
-@app.post("/chat")
-async def chat_endpoint(request: Request):
-    """
-    Proxy hacia Google Gemini 2.0 Flash con streaming SSE.
-    Body esperado: { "messages": [...], "stream": true }
-    """
-    if not GEMINI_KEY:
-        return {"error": "GEMINI_API_KEY not configured in Railway variables"}
+    away = next((c["team"]["displayName"] for c in competitors if c.get("homeAway")=="away"), "Away")
+    home = next((c["team"]["displayName"] for c in competitors if c.get("homeAway")=="home"), "Home")
+    away_abbr = next((c["team"]["abbreviation"] for c in competitors if c.get("homeAway")=="away"), "")
+    home_abbr = next((c["team"]["abbreviation"] for c in competitors if c.get("homeAway")=="home"), "")
 
     try:
-        body = await request.json()
-        messages = body.get("messages", [])
+        ev_dt = datetime.datetime.fromisoformat(ev["date"].replace("Z","+00:00")).astimezone(ET)
+        game_time = ev_dt.strftime("%-I:%M %p ET")
+    except:
+        game_time = "--"
 
-        # Convertir historial al formato Gemini (contents)
-        # Gemini usa roles: "user" y "model" (no "assistant")
-        gemini_contents = []
-        for msg in messages[-10:]:
-            role = "model" if msg["role"] == "assistant" else "user"
-            gemini_contents.append({
-                "role": role,
-                "parts": [{"text": msg["content"]}]
+    ml = odds.get("moneyline", {})
+    away_close = parse_int_odds(ml.get("away",{}).get("close",{}).get("odds"))
+    home_close = parse_int_odds(ml.get("home",{}).get("close",{}).get("odds"))
+    away_open  = parse_int_odds(ml.get("away",{}).get("open",{}).get("odds"))
+    home_open  = parse_int_odds(ml.get("home",{}).get("open",{}).get("odds"))
+
+    total_obj   = odds.get("total", {})
+    ou_line     = odds.get("overUnder")
+    under_close = parse_int_odds(total_obj.get("under",{}).get("close",{}).get("odds"))
+    over_close  = parse_int_odds(total_obj.get("over", {}).get("close",{}).get("odds"))
+    under_open  = parse_int_odds(total_obj.get("under",{}).get("open",{}).get("odds"))
+
+    if not (away_close and home_close):
+        return []
+
+    ao = away_open  if away_open  else away_close
+    ho = home_open  if home_open  else home_close
+    away_move = away_close - ao
+    home_move = home_close - ho
+
+    nvp_a, nvp_h = vig_free(american_to_prob(away_close), american_to_prob(home_close))
+    candidates = []
+
+    # ── ML PLAYS ──
+    for team, team_abbr, odds_val, nvp, move in [
+        (away, away_abbr, away_close, nvp_a, away_move),
+        (home, home_abbr, home_close, nvp_h, home_move),
+    ]:
+        inds = []
+        score = 0
+        is_dog = odds_val > 0
+
+        # RLM: underdog line shortened = sharp action
+        if is_dog and move < -6:
+            inds.append(f"&#x26A1; RLM → {team.split()[-1]}")
+            score += 12
+
+        # Steam: favorite moved by sharps
+        if not is_dog and move < -10:
+            inds.append(f"Steam {team.split()[-1]} ({move:+d}¢)")
+            score += 8
+
+        # NVP value on underdog
+        if is_dog and nvp > 0.40:
+            inds.append(f"NVP {round(nvp*100,1)}%")
+            score += 6
+
+        # Sweet spot underdog range
+        if is_dog and 110 <= odds_val <= 200:
+            inds.append(f"Rango +EV ({fmt_american(odds_val)})")
+            score += 4
+
+        # Stable line = no sharp movement but still value
+        if is_dog and abs(move) <= 3 and nvp > 0.38:
+            inds.append("Línea estable · valor intacto")
+            score += 3
+
+        if score >= 10 and len(inds) >= 2:
+            conf = min(74, 50 + score)
+            units = 1.5 if conf>=70 else (1.0 if conf>=65 else (1.0 if conf>=58 else 0.5))
+            stake = 7.50 if units==1.5 else (5.0 if units==1.0 else 2.50)
+            label = "TOP PLAY" if conf>=70 else ("SHARP" if conf>=65 else ("VALUE" if conf>=58 else "WATCH"))
+            book_impl = american_to_prob(odds_val)
+            edge = max(round(abs(nvp - book_impl)*100 + abs(move)*0.3, 1), 3.5)
+            candidates.append({
+                "sport": sport_label,
+                "matchup": f"{away} @ {home}",
+                "away_team": away, "home_team": home,
+                "away_abbr": away_abbr, "home_abbr": home_abbr,
+                "game_time": game_time,
+                "bet": f"{team} ML",
+                "odds": fmt_american(odds_val),
+                "odds_raw": odds_val,
+                "confidence": conf, "edge": edge,
+                "label": label, "units": units, "stake": stake,
+                "indicators": inds,
+                "bookmaker": "DraftKings",
+                "data_sport": sport_label.lower(),
+                "_score": score,
             })
 
-        gemini_url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:streamGenerateContent?alt=sse&key={GEMINI_KEY}"
-        )
+    # ── TOTALS ──
+    if under_close and ou_line:
+        uo = under_open if under_open else under_close
+        under_move = under_close - uo
+        t_inds = []
+        t_score = 0
 
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": SPORTS_SYSTEM}]
-            },
-            "contents": gemini_contents,
-            "generationConfig": {
-                "maxOutputTokens": 1200,
-                "temperature": 0.3,
-            },
-            "tools": [{"google_search": {}}],
-        }
+        if under_move < -8:
+            t_inds.append(f"&#x26A1; Sharp Under ({under_move:+d}¢)")
+            t_score += 12
 
-        async def stream_gemini():
-            async with httpx.AsyncClient(timeout=30) as client:
-                async with client.stream(
-                    "POST",
-                    gemini_url,
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                ) as resp:
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        d = line[6:].strip()
-                        if d == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            break
-                        try:
-                            parsed = json.loads(d)
-                            parts = (
-                                parsed.get("candidates", [{}])[0]
-                                .get("content", {})
-                                .get("parts", [])
-                            )
-                            # Concatenar solo partes de texto (ignorar search metadata)
-                            text = "".join(
-                                p.get("text", "") for p in parts if "text" in p
-                            )
-                            if text:
-                                chunk = json.dumps({
-                                    "choices": [{"delta": {"content": text}}]
-                                })
-                                yield f"data: {chunk}\n\n"
-                        except Exception:
-                            pass
-                    yield "data: [DONE]\n\n"
+        if under_close > -115:
+            t_inds.append(f"Under valor ({fmt_american(under_close)})")
+            t_score += 6
 
-        return StreamingResponse(
-            stream_gemini(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Access-Control-Allow-Origin": "*",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        t_inds.append(f"O/U {ou_line}")
+        t_score += 2
 
-    except Exception as e:
-        return {"error": str(e)}
+        if t_score >= 8:
+            conf = min(72, 50 + t_score)
+            units = 1.5 if conf>=70 else (1.0 if conf>=65 else (1.0 if conf>=58 else 0.5))
+            stake = 7.50 if units==1.5 else (5.0 if units==1.0 else 2.50)
+            label = "TOP PLAY" if conf>=70 else ("SHARP" if conf>=65 else ("VALUE" if conf>=58 else "WATCH"))
+            edge = max(round(abs(under_move)*0.4, 1), 3.5)
+            candidates.append({
+                "sport": sport_label,
+                "matchup": f"{away} @ {home}",
+                "away_team": away, "home_team": home,
+                "away_abbr": away_abbr, "home_abbr": home_abbr,
+                "game_time": game_time,
+                "bet": f"Under {ou_line}",
+                "odds": fmt_american(under_close),
+                "odds_raw": under_close,
+                "confidence": conf, "edge": edge,
+                "label": label, "units": units, "stake": stake,
+                "indicators": t_inds,
+                "bookmaker": "DraftKings",
+                "data_sport": sport_label.lower(),
+                "_score": t_score,
+            })
+
+    return candidates
+
+
+def generate_plays(date_str: str = None) -> dict:
+    """Fetch ESPN data for all sports and return sorted plays."""
+    if date_str is None:
+        date_str = get_today_str()
+
+    all_cands = []
+    total_games = 0
+
+    for sport_key, sport_label in SPORT_LABELS.items():
+        events = fetch_espn_scoreboard(sport_key, date_str)
+        total_games += len(events)
+        for ev in events:
+            cands = analyze_espn_event(ev, sport_label)
+            all_cands.extend(cands)
+
+    # Sort by score * edge descending
+    all_cands.sort(key=lambda p: p["_score"] * p["edge"], reverse=True)
+
+    # Deduplicate: max 1 play per matchup
+    seen = set()
+    top_plays = []
+    for p in all_cands:
+        key = p["matchup"]
+        if key not in seen and len(top_plays) < 8:
+            seen.add(key)
+            p["id"] = len(top_plays) + 1
+            # Clean internal field
+            del p["_score"]
+            top_plays.append(p)
+
+    now_et = datetime.datetime.now(ET)
+    return {
+        "date": date_str,
+        "generated_at": now_et.isoformat(),
+        "total_games_scanned": total_games,
+        "plays_count": len(top_plays),
+        "plays": top_plays,
+        "avg_confidence": round(sum(p["confidence"] for p in top_plays)/max(len(top_plays),1), 1),
+        "top_edge": max((p["edge"] for p in top_plays), default=0),
+        "data_source": "ESPN/DraftKings",
+    }
+
+
+# ─────────────────────────── ESPN SCOREBOARD/SCORES ─────────────────
+
+def build_summary_from_espn():
+    date_str = get_today_str()
+    total = 0
+    sports_active = []
+    rlm_detected = []
+    injuries = []
+
+    for sk, sl in SPORT_LABELS.items():
+        events = fetch_espn_scoreboard(sk, date_str)
+        if events:
+            total += len(events)
+            sports_active.append(sl)
+        # Check for any RLM signals
+        for ev in events:
+            comps = ev.get("competitions", [{}])[0]
+            competitors = comps.get("competitors", [])
+            odds_list = comps.get("odds", [])
+            if not odds_list: continue
+            odds = odds_list[0]
+            ml = odds.get("moneyline", {})
+            away_close = parse_int_odds(ml.get("away",{}).get("close",{}).get("odds"))
+            away_open  = parse_int_odds(ml.get("away",{}).get("open",{}).get("odds"))
+            home_close = parse_i
