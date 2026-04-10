@@ -248,4 +248,68 @@ def chat():
         "Eres SharpEdge AI, un experto analista de apuestas institucionales especializado en NFL, NHL, MLB, NBA y Soccer. "
         "Ayudas a un apostador nuevo con bankroll menor a $500. Unidad base = $5. "
         "Respondes en español, de forma profesional, directa y precisa. "
-        "Identificas jugadas con al menos 3 i
+        "Identificas jugadas con al menos 3 indicadores confluentes (RLM, Steam, NVP, Sharp Money). "
+        "Para el usuario: plataforma exclusiva BET365."
+    )
+
+    contents = []
+    for h in history[-10:]:
+        role = "user" if h.get("role") == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": h.get("content", "")}]})
+    contents.append({"role": "user", "parts": [{"text": user_msg}]})
+
+    payload = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": contents,
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
+    }
+
+    def generate():
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=" + GEMINI_KEY
+        try:
+            with requests.post(url, json=payload, stream=True, timeout=60) as r:
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    line = line.decode("utf-8") if isinstance(line, bytes) else line
+                    if line.startswith("data:"):
+                        raw = line[5:].strip()
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(raw)
+                            parts = (obj.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                            for p in parts:
+                                text = p.get("text", "")
+                                if text:
+                                    yield "data: " + json.dumps({"text": text}) + "\n\n"
+                        except Exception:
+                            pass
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield "data: " + json.dumps({"error": str(e)}) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+# ─── /polymarket ───────────────────────────────────────────────────
+@app.route("/polymarket")
+def polymarket():
+    try:
+        r = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"closed": "false", "limit": 50, "order": "volume", "ascending": "false"},
+            timeout=8,
+        )
+        markets = r.json() if r.ok else []
+    except Exception:
+        markets = []
+    return jsonify({"markets": markets})
+
+# ─── start ─────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    print("SharpEdge Backend starting on port", port)
+    app.run(host="0.0.0.0", port=port, debug=False)
